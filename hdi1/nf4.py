@@ -11,7 +11,8 @@ except ImportError:
 from transformers import (
     LlamaForCausalLM, PreTrainedTokenizerFast, LlamaConfig,
     CLIPTextModelWithProjection, CLIPTokenizer, CLIPConfig,
-    T5EncoderModel, T5Tokenizer, T5Config
+    T5EncoderModel, T5Tokenizer, T5Config,
+    BitsAndBytesConfig # <<< Import BitsAndBytesConfig
 )
 from diffusers.models import AutoencoderKL
 from diffusers.schedulers import SchedulerMixin
@@ -31,7 +32,7 @@ from .schedulers.flash_flow_match import FlashFlowMatchEulerDiscreteScheduler
 
 
 MODEL_PREFIX = "azaneko"
-# Llama model remains external
+# External Llama model
 LLAMA_MODEL_NAME = "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4"
 # Other encoders will be loaded from local subfolders
 
@@ -84,8 +85,6 @@ def log_ram(msg: str):
 
 
 def load_models(model_type: str):
-    # --- THIS ENTIRE FUNCTION IS UNCHANGED FROM THE PREVIOUS VERSION ---
-    # --- It successfully loaded the models in the last run ---
     overall_start_time = time.time() # Start overall timer
     log_ram(f"Start of load_models for type '{model_type}'")
     print(f"--- Loading model type: {model_type} ---")
@@ -97,7 +96,7 @@ def load_models(model_type: str):
     if not torch.cuda.is_available(): raise RuntimeError("CUDA not available.")
     num_gpus = torch.cuda.device_count()
     target_device_main = "cuda:0" # Target device for non-distributed components
-    loading_dtype = torch.bfloat16 # Default dtype
+    loading_dtype = torch.bfloat16 # Default overall dtype
     if num_gpus < 2:
         print("⚠️ Only one GPU detected.")
         max_memory_llama = None
@@ -112,7 +111,7 @@ def load_models(model_type: str):
         max_memory_llama = {i: gpu_mem_limit for i in range(num_gpus)}
         max_memory_llama["cpu"] = cpu_mem_limit
         print(f"   Providing max_memory hint to device_map for Text Encoder 4: {max_memory_llama}")
-        # Map for T5 (FORCE to CPU as much as possible) ### NEW ###
+        # Map for T5 (FORCE to CPU as much as possible)
         max_memory_t5_cpu = {"cpu": cpu_mem_limit}
         print(f"   Max memory hint for T5 Encoder (forcing CPU): {max_memory_t5_cpu}")
         # Offload folder (can be shared)
@@ -133,6 +132,7 @@ def load_models(model_type: str):
 
 
     # --- Load ALL Tokenizers (CPU) ---
+    # ... (Keep same as previous version) ...
     start_time = time.time()
     print("🔄 Loading ALL Tokenizers...")
     log_ram("Before tokenizers load")
@@ -150,6 +150,7 @@ def load_models(model_type: str):
 
 
     # --- Load Text Encoder 4 (Llama) using device_map="auto" ---
+    # ... (Keep same as previous version) ...
     start_time = time.time()
     print("🔄 Loading Text Encoder 4 (Llama) with device_map='auto'...")
     log_ram("Before text encoder 4 load")
@@ -164,6 +165,7 @@ def load_models(model_type: str):
 
 
     # --- Load Text Encoder 1 & 2 (CLIP L/G) onto target_device_main ---
+    # ... (Keep same as previous version) ...
     print(f"🔄 Loading CLIP Text Encoders onto {target_device_main} from LOCAL subfolders...")
     start_time = time.time()
     log_ram("Before CLIP encoders load")
@@ -178,8 +180,8 @@ def load_models(model_type: str):
         print(f"❌ FAILED to load CLIP text encoders from subfolders: {e}")
         raise e
 
-
     # --- Load Text Encoder 3 (T5-XXL) using Accelerate -> CPU Offload ---
+    # ... (Keep same as previous version) ...
     start_time = time.time()
     print(f"🔄 Loading Text Encoder 3 (T5) via Accelerate with forced CPU offload...")
     log_ram("Before text encoder 3 load")
@@ -192,9 +194,7 @@ def load_models(model_type: str):
         if num_gpus >= 2:
             device_map_t5 = infer_auto_device_map(text_encoder_3, max_memory=max_memory_t5_cpu, no_split_module_classes=["T5Block"])
             print(f"   T5 device map (forced CPU): {device_map_t5}")
-        else:
-            device_map_t5 = None
-            print(f"   Loading T5 directly to {target_device_main}")
+        else: device_map_t5 = None; print(f"   Loading T5 directly to {target_device_main}")
 
         load_checkpoint_in_model(
              text_encoder_3, checkpoint=t5_subfolder_path, device_map=device_map_t5,
@@ -204,18 +204,17 @@ def load_models(model_type: str):
         log_vram("✅ Text encoder 3 loaded!")
     except Exception as e:
         print(f"❌ FAILED to load T5 Encoder: {e}")
-        try:
+        try: # Fallback to CPU
             print("   Retrying T5 load directly to CPU...")
             text_encoder_3 = T5EncoderModel.from_pretrained(t5_subfolder_path, torch_dtype=loading_dtype, use_safetensors=True, low_cpu_mem_usage=True).to('cpu')
             log_vram("✅ Text encoder 3 loaded (Direct to CPU Fallback)!")
-        except Exception as e2:
-             print(f"❌ FAILED fallback T5 load to CPU: {e2}")
-             raise e
+        except Exception as e2: print(f"❌ FAILED fallback T5 load to CPU: {e2}"); raise e
     log_ram("After text encoder 3 load")
     print(f"   Text encoder 3 load time: {time.time() - start_time:.2f}s\\n")
 
 
     # --- Load VAE onto SINGLE GPU ---
+    # ... (Keep same as previous version) ...
     start_time = time.time()
     print(f"🔄 Loading VAE onto {target_device_main} from LOCAL subfolder...")
     log_ram("Before VAE load")
@@ -228,20 +227,37 @@ def load_models(model_type: str):
     print(f"   VAE load time: {time.time() - start_time:.2f}s\\n")
 
 
-    # --- Load TRANSFORMER onto SINGLE GPU ---
+    # --- Load TRANSFORMER onto SINGLE GPU with BitsAndBytes --- ### MODIFIED ###
     start_time = time.time()
-    print(f"🔄 Loading Transformer onto {target_device_main} from LOCAL subfolder...")
+    print(f"🔄 Loading Transformer onto {target_device_main} from LOCAL subfolder with explicit BnB config...")
     log_ram("Before transformer load")
+    # Create BitsAndBytesConfig based on transformer/config.json
+    # Config showed: nf4, float16 compute, no double quant
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16, # Use bf16 compute dtype to match others
+        bnb_4bit_use_double_quant=False,
+    )
+    print(f"   Using BitsAndBytesConfig: {bnb_config}")
+
     transformer = HiDreamImageTransformer2DModel.from_pretrained(
-        local_hidream_repo_path, subfolder="transformer", torch_dtype=loading_dtype,
+        local_hidream_repo_path, # Use local path
+        subfolder="transformer",
+        quantization_config=bnb_config, # Pass explicit config
+        # torch_dtype argument might be ignored when quantization_config is used
         low_cpu_mem_usage=True,
-    ).to(target_device_main)
+        # device_map=target_device_main # Load directly onto target device
+    )
+    # Explicit .to() might not be needed if device_map in quantization works, but add for safety
+    transformer.to(target_device_main)
     log_vram(f"✅ Transformer loaded onto {target_device_main}!")
     log_ram("After transformer load")
     print(f"   Transformer load time: {time.time() - start_time:.2f}s\\n")
 
 
     # --- Instantiate Scheduler ---
+    # ... (Keep same as previous version) ...
     start_time = time.time()
     print("🔄 Initializing scheduler...")
     scheduler_class = config["scheduler"]
@@ -259,6 +275,7 @@ def load_models(model_type: str):
 
 
     # --- Instantiate Pipeline MANUALLY ---
+    # ... (Keep same as previous version, including transformer assignment) ...
     start_time = time.time()
     print("🔄 Instantiating HiDreamImagePipeline manually with ALL components...")
     log_ram("Before pipeline instantiation")
@@ -284,6 +301,7 @@ def load_models(model_type: str):
 
 @torch.inference_mode()
 def generate_image(pipe: HiDreamImagePipeline, model_type: str, prompt: str, resolution: tuple[int, int], seed: int):
+    # (generate_image function remains the same - using default generator)
     overall_start_time = time.time()
     log_ram("Start of generate_image")
     config = MODEL_CONFIGS[model_type]
@@ -292,26 +310,16 @@ def generate_image(pipe: HiDreamImagePipeline, model_type: str, prompt: str, res
     width, height = resolution
     if seed == -1:
         seed = torch.randint(0, 1000000, (1,)).item()
-
-    # --- Generator - Use default device --- ### MODIFIED ###
-    generator = torch.Generator().manual_seed(seed) # Let pipeline/ops determine device
+    generator = torch.Generator().manual_seed(seed)
     print(f"⏳ Starting image generation (Steps: {num_inference_steps}, Guidance: {guidance_scale}, Seed: {seed})...")
     gen_start_time = time.time()
-
-    # Ensure pipeline internals handle device placement correctly (needs modification in _encode_prompt)
     images = pipe(
-        prompt,
-        height=height,
-        width=width,
-        guidance_scale=guidance_scale,
-        num_inference_steps=num_inference_steps,
-        num_images_per_prompt=1,
-        generator=generator, # Pass the generator without explicit device
+        prompt, height=height, width=width, guidance_scale=guidance_scale, num_inference_steps=num_inference_steps,
+        num_images_per_prompt=1, generator=generator,
     ).images
     print(f"   Pipeline call time: {time.time() - gen_start_time:.2f}s")
     print("✅ Image generation complete.")
     log_ram("After image generation")
-    if images is None or len(images) == 0:
-        raise RuntimeError("Image generation failed, pipeline returned no images.")
+    if images is None or len(images) == 0: raise RuntimeError("Image generation failed.")
     print(f"--- Total generate_image time: {time.time() - overall_start_time:.2f}s ---")
     return images[0], seed
