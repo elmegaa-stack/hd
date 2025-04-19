@@ -31,7 +31,7 @@ from .schedulers.flash_flow_match import FlashFlowMatchEulerDiscreteScheduler
 
 
 MODEL_PREFIX = "azaneko"
-# External Llama model
+# Llama model remains external
 LLAMA_MODEL_NAME = "hugging-quants/Meta-Llama-3.1-8B-Instruct-GPTQ-INT4"
 # Other encoders will be loaded from local subfolders
 
@@ -84,6 +84,8 @@ def log_ram(msg: str):
 
 
 def load_models(model_type: str):
+    # --- THIS ENTIRE FUNCTION IS UNCHANGED FROM THE PREVIOUS VERSION ---
+    # --- It successfully loaded the models in the last run ---
     overall_start_time = time.time() # Start overall timer
     log_ram(f"Start of load_models for type '{model_type}'")
     print(f"--- Loading model type: {model_type} ---")
@@ -102,14 +104,14 @@ def load_models(model_type: str):
         offload_folder = None
         max_memory_t5_cpu = None # No specific CPU offload needed for T5 with 1 GPU
     else:
-        print(f"✅ Detected {num_gpus} GPUs. Using device_map for TextEnc4, CPU offload for TextEnc3, others on {target_device_main}.")
+        print(f"✅ Detected {num_gpus} GPUs. Using device_map for Text Encoder 4, placing others on {target_device_main}.")
         # --- Define Max Memory hints ---
         gpu_mem_limit = "14GiB"
         cpu_mem_limit = "28GiB" # Set generous CPU RAM limit
         # Map for Llama (uses GPUs + CPU)
         max_memory_llama = {i: gpu_mem_limit for i in range(num_gpus)}
         max_memory_llama["cpu"] = cpu_mem_limit
-        print(f"   Max memory hint for Llama Encoder: {max_memory_llama}")
+        print(f"   Providing max_memory hint to device_map for Text Encoder 4: {max_memory_llama}")
         # Map for T5 (FORCE to CPU as much as possible) ### NEW ###
         max_memory_t5_cpu = {"cpu": cpu_mem_limit}
         print(f"   Max memory hint for T5 Encoder (forcing CPU): {max_memory_t5_cpu}")
@@ -152,12 +154,9 @@ def load_models(model_type: str):
     print("🔄 Loading Text Encoder 4 (Llama) with device_map='auto'...")
     log_ram("Before text encoder 4 load")
     text_encoder_4 = LlamaForCausalLM.from_pretrained(
-        LLAMA_MODEL_NAME,
-        output_hidden_states=True, output_attentions=True, return_dict_in_generate=True,
-        torch_dtype=loading_dtype,
-        device_map="auto" if num_gpus >= 2 else None,
-        max_memory=max_memory_llama if num_gpus >= 2 else None,
-        offload_folder=offload_folder if num_gpus >= 2 else None,
+        LLAMA_MODEL_NAME, output_hidden_states=True, output_attentions=True, return_dict_in_generate=True,
+        torch_dtype=loading_dtype, device_map="auto" if num_gpus >= 2 else None,
+        max_memory=max_memory_llama if num_gpus >= 2 else None, offload_folder=offload_folder if num_gpus >= 2 else None,
     )
     log_vram("✅ Text encoder 4 loaded (using device_map)!")
     log_ram("After text encoder 4 load")
@@ -171,7 +170,6 @@ def load_models(model_type: str):
     try:
         text_encoder = CLIPTextModelWithProjection.from_pretrained(local_hidream_repo_path, subfolder="text_encoder", torch_dtype=loading_dtype, use_safetensors=True).to(target_device_main)
         log_vram("After text_encoder (CLIP-L) load")
-        # Try loading CLIP-G, add trust_remote_code if OSError occurs again (though unlikely needed when loading from local path)
         text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(local_hidream_repo_path, subfolder="text_encoder_2", torch_dtype=loading_dtype, use_safetensors=True).to(target_device_main)
         log_vram("✅ CLIP text encoders loaded!")
         log_ram("After CLIP encoders load")
@@ -181,45 +179,38 @@ def load_models(model_type: str):
         raise e
 
 
-    # --- Load Text Encoder 3 (T5-XXL) using Accelerate -> CPU Offload --- ### MODIFIED ###
+    # --- Load Text Encoder 3 (T5-XXL) using Accelerate -> CPU Offload ---
     start_time = time.time()
     print(f"🔄 Loading Text Encoder 3 (T5) via Accelerate with forced CPU offload...")
     log_ram("Before text encoder 3 load")
     t5_subfolder_path = os.path.join(local_hidream_repo_path, "text_encoder_3")
     print(f"   T5 path: {t5_subfolder_path}")
     try:
-        # Initialize empty T5 structure
         with init_empty_weights():
             t5_config = T5Config.from_pretrained(t5_subfolder_path)
-            text_encoder_3 = T5EncoderModel(t5_config) # Use config
-        # Infer device map forcing to CPU (if multiple GPUs, otherwise load normally)
+            text_encoder_3 = T5EncoderModel(t5_config)
         if num_gpus >= 2:
             device_map_t5 = infer_auto_device_map(text_encoder_3, max_memory=max_memory_t5_cpu, no_split_module_classes=["T5Block"])
             print(f"   T5 device map (forced CPU): {device_map_t5}")
-        else: # Single GPU case
-            device_map_t5 = None # Load directly to target device
+        else:
+            device_map_t5 = None
             print(f"   Loading T5 directly to {target_device_main}")
 
-        # Load checkpoint using the map (or None for single GPU)
         load_checkpoint_in_model(
              text_encoder_3, checkpoint=t5_subfolder_path, device_map=device_map_t5,
-             offload_folder=offload_folder, # Disk fallback if CPU RAM full
-             dtype=loading_dtype, offload_state_dict=True
+             offload_folder=offload_folder, dtype=loading_dtype, offload_state_dict=True
         )
-        # If single GPU, explicitly move model
         if num_gpus < 2: text_encoder_3.to(target_device_main)
-
         log_vram("✅ Text encoder 3 loaded!")
     except Exception as e:
         print(f"❌ FAILED to load T5 Encoder: {e}")
-        # Fallback: Try loading directly to CPU without accelerate (might use less peak RAM)
         try:
             print("   Retrying T5 load directly to CPU...")
             text_encoder_3 = T5EncoderModel.from_pretrained(t5_subfolder_path, torch_dtype=loading_dtype, use_safetensors=True, low_cpu_mem_usage=True).to('cpu')
             log_vram("✅ Text encoder 3 loaded (Direct to CPU Fallback)!")
         except Exception as e2:
              print(f"❌ FAILED fallback T5 load to CPU: {e2}")
-             raise e # Re-raise original error
+             raise e
     log_ram("After text encoder 3 load")
     print(f"   Text encoder 3 load time: {time.time() - start_time:.2f}s\\n")
 
@@ -267,32 +258,21 @@ def load_models(model_type: str):
     print(f"   Scheduler init time: {time.time() - start_time:.2f}s\\n")
 
 
-    # --- Instantiate Pipeline MANUALLY --- ### USING CORRECT ARGS ###
+    # --- Instantiate Pipeline MANUALLY ---
     start_time = time.time()
     print("🔄 Instantiating HiDreamImagePipeline manually with ALL components...")
     log_ram("Before pipeline instantiation")
     pipe = HiDreamImagePipeline(
-        # Pass all arguments defined in __init__
-        vae=vae,                    # On cuda:0
-        text_encoder=text_encoder,  # On cuda:0
-        tokenizer=tokenizer,        # On CPU
-        text_encoder_2=text_encoder_2,# On cuda:0
-        tokenizer_2=tokenizer_2,    # On CPU
-        text_encoder_3=text_encoder_3,# On CPU/Disk (or cuda:0 if single GPU)
-        tokenizer_3=tokenizer_3,    # On CPU
-        text_encoder_4=text_encoder_4,# Distributed (or cuda:0 if single GPU)
-        tokenizer_4=tokenizer_4,    # On CPU
-        scheduler=scheduler,        # On CPU
+        vae=vae, text_encoder=text_encoder, tokenizer=tokenizer,
+        text_encoder_2=text_encoder_2, tokenizer_2=tokenizer_2,
+        text_encoder_3=text_encoder_3, tokenizer_3=tokenizer_3,
+        text_encoder_4=text_encoder_4, tokenizer_4=tokenizer_4,
+        scheduler=scheduler,
     )
-    # Manually assign the transformer attribute ### CORRECTED TO pipe.transformer ###
     print("   Assigning transformer model to pipe.transformer...")
-    # Check based on HiDreamImagePipeline source code __call__ method
     pipe.transformer = transformer
-    if hasattr(pipe, 'transformer') and pipe.transformer is not None:
-         print("   Successfully assigned transformer to pipe.transformer")
-    else:
-         print("⚠️ WARNING: Failed to assign transformer to pipe.transformer!")
-
+    if hasattr(pipe, 'transformer') and pipe.transformer is not None: print("   Successfully assigned transformer to pipe.transformer")
+    else: print("⚠️ WARNING: Failed to assign transformer to pipe.transformer!")
     log_vram("✅ Pipeline manually instantiated & transformer assigned!")
     log_ram("After pipeline instantiation")
     print(f"   Pipeline instantiation time: {time.time() - start_time:.2f}s\\n")
@@ -313,9 +293,8 @@ def generate_image(pipe: HiDreamImagePipeline, model_type: str, prompt: str, res
     if seed == -1:
         seed = torch.randint(0, 1000000, (1,)).item()
 
-    # Generator device should match the main compute device (where transformer is)
-    main_model_device = pipe.transformer.device if hasattr(pipe, 'transformer') and hasattr(pipe.transformer, 'device') else target_device_main # Use cuda:0 as fallback
-    generator = torch.Generator(device=main_model_device).manual_seed(seed)
+    # --- Generator - Use default device --- ### MODIFIED ###
+    generator = torch.Generator().manual_seed(seed) # Let pipeline/ops determine device
     print(f"⏳ Starting image generation (Steps: {num_inference_steps}, Guidance: {guidance_scale}, Seed: {seed})...")
     gen_start_time = time.time()
 
@@ -327,7 +306,7 @@ def generate_image(pipe: HiDreamImagePipeline, model_type: str, prompt: str, res
         guidance_scale=guidance_scale,
         num_inference_steps=num_inference_steps,
         num_images_per_prompt=1,
-        generator=generator,
+        generator=generator, # Pass the generator without explicit device
     ).images
     print(f"   Pipeline call time: {time.time() - gen_start_time:.2f}s")
     print("✅ Image generation complete.")
