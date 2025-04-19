@@ -368,6 +368,8 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
             )
         return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
 
+    # Inside class HiDreamImagePipeline:
+
     def _encode_prompt(
         self,
         prompt: Union[str, List[str]],
@@ -381,8 +383,8 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
         pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
         max_sequence_length: int = 128,
     ):
-        device = device or self._execution_device
-        
+        device = device or self._execution_device # Get the target device (usually cuda:0)
+
         if prompt_embeds is None:
             prompt_2 = prompt_2 or prompt
             prompt_2 = [prompt_2] if isinstance(prompt_2, str) else prompt_2
@@ -393,43 +395,46 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
             prompt_4 = prompt_4 or prompt
             prompt_4 = [prompt_4] if isinstance(prompt_4, str) else prompt_4
 
+            # Calculate pooled embeds (CLIP L + G) -> these should end up on target_device_main via the encoders
             pooled_prompt_embeds_1 = self._get_clip_prompt_embeds(
-                self.tokenizer,
-                self.text_encoder,
-                prompt = prompt,
-                num_images_per_prompt = num_images_per_prompt,
-                max_sequence_length = max_sequence_length,
-                device = device,
-                dtype = dtype,
+                self.tokenizer, self.text_encoder, prompt=prompt, num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length, device=device, dtype=dtype, # Pass device
             )
-
             pooled_prompt_embeds_2 = self._get_clip_prompt_embeds(
-                self.tokenizer_2,
-                self.text_encoder_2,
-                prompt = prompt_2,
-                num_images_per_prompt = num_images_per_prompt,
-                max_sequence_length = max_sequence_length,
-                device = device,
-                dtype = dtype,
+                self.tokenizer_2, self.text_encoder_2, prompt=prompt_2, num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length, device=device, dtype=dtype, # Pass device
             )
-
+            # Concatenate -> result should be on device
             pooled_prompt_embeds = torch.cat([pooled_prompt_embeds_1, pooled_prompt_embeds_2], dim=-1)
 
+            # Calculate T5 embeds -> T5 encoder is on CPU, so output is on CPU
             t5_prompt_embeds = self._get_t5_prompt_embeds(
-                prompt = prompt_3,
-                num_images_per_prompt = num_images_per_prompt,
-                max_sequence_length = max_sequence_length,
-                device = device,
-                dtype = dtype
+                prompt=prompt_3, num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                # device=device, # Let T5 run on its own device (CPU)
+                dtype=dtype
             )
+            # <<< MOVE T5 OUTPUT TO TARGET DEVICE >>> ### ADDED ###
+            t5_prompt_embeds = t5_prompt_embeds.to(device=device, dtype=dtype)
+
+            # Calculate Llama embeds -> Llama encoder is distributed, output device depends on accelerate
             llama3_prompt_embeds = self._get_llama3_prompt_embeds(
-                prompt = prompt_4,
-                num_images_per_prompt = num_images_per_prompt,
-                max_sequence_length = max_sequence_length,
-                device = device,
-                dtype = dtype
+                prompt=prompt_4, num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                # device=device, # Let accelerate handle device placement internally
+                dtype=dtype
             )
+            # <<< MOVE LLAMA OUTPUT TO TARGET DEVICE (if not already there) >>> ### ADDED ###
+            # Note: Llama output is [layers, batch*num, seq, dim], we need to move each layer's tensor
+            # It's safer to ensure it's on the correct device before combining later
+            llama3_prompt_embeds = llama3_prompt_embeds.to(device=device, dtype=dtype)
+
+
+            # Combine embeds
             prompt_embeds = [t5_prompt_embeds, llama3_prompt_embeds]
+
+        # Ensure final pooled embeds are on the correct device
+        pooled_prompt_embeds = pooled_prompt_embeds.to(device=device, dtype=dtype)
 
         return prompt_embeds, pooled_prompt_embeds
 
