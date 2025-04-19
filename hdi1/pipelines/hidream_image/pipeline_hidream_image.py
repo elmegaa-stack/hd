@@ -368,21 +368,38 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
             )
         return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
 
+    # === CODE TO REPLACE _encode_prompt in HiDreamImagePipeline ===
+
+    # Inside class HiDreamImagePipeline:
+
     def _encode_prompt(
         self,
         prompt: Union[str, List[str]],
         prompt_2: Union[str, List[str]],
         prompt_3: Union[str, List[str]],
         prompt_4: Union[str, List[str]],
-        device: Optional[torch.device] = None,
+        device: Optional[torch.device] = None, # This 'device' might be overridden by target_device
         dtype: Optional[torch.dtype] = None,
         num_images_per_prompt: int = 1,
         prompt_embeds: Optional[List[torch.FloatTensor]] = None,
         pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
         max_sequence_length: int = 128,
     ):
-        device = device or self._execution_device
-        
+        # Determine the target device definitively - where the main model (transformer) runs
+        # Use self.device which DiffusionPipeline sets based on component placement
+        target_device = self.device
+        print(f"[_encode_prompt] Target device for embeddings: {target_device}") # Add log
+
+        # Determine target dtype, default to transformer's dtype if available
+        target_dtype = dtype
+        if target_dtype is None:
+             if hasattr(self, 'transformer') and self.transformer is not None and hasattr(self.transformer, 'dtype'):
+                 target_dtype = self.transformer.dtype
+             elif hasattr(self, 'text_encoder') and self.text_encoder is not None: # Fallback to first text encoder
+                 target_dtype = self.text_encoder.dtype
+        print(f"[_encode_prompt] Target dtype for embeddings: {target_dtype}") # Add log
+
+
         if prompt_embeds is None:
             prompt_2 = prompt_2 or prompt
             prompt_2 = [prompt_2] if isinstance(prompt_2, str) else prompt_2
@@ -393,43 +410,59 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
             prompt_4 = prompt_4 or prompt
             prompt_4 = [prompt_4] if isinstance(prompt_4, str) else prompt_4
 
+            # === Get CLIP Embeds ===
+            # These encoders are on target_device, so outputs should be too.
             pooled_prompt_embeds_1 = self._get_clip_prompt_embeds(
-                self.tokenizer,
-                self.text_encoder,
-                prompt = prompt,
-                num_images_per_prompt = num_images_per_prompt,
-                max_sequence_length = max_sequence_length,
-                device = device,
-                dtype = dtype,
+                self.tokenizer, self.text_encoder, prompt=prompt, num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length, device=target_device, dtype=target_dtype,
             )
-
             pooled_prompt_embeds_2 = self._get_clip_prompt_embeds(
-                self.tokenizer_2,
-                self.text_encoder_2,
-                prompt = prompt_2,
-                num_images_per_prompt = num_images_per_prompt,
-                max_sequence_length = max_sequence_length,
-                device = device,
-                dtype = dtype,
+                self.tokenizer_2, self.text_encoder_2, prompt=prompt_2, num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length, device=target_device, dtype=target_dtype,
             )
-
+            # Concatenate -> result is on target_device
             pooled_prompt_embeds = torch.cat([pooled_prompt_embeds_1, pooled_prompt_embeds_2], dim=-1)
 
+
+            # === Get T5 Embeds ===
+            # T5 encoder is on CPU/Disk. Output will be CPU.
             t5_prompt_embeds = self._get_t5_prompt_embeds(
-                prompt = prompt_3,
-                num_images_per_prompt = num_images_per_prompt,
-                max_sequence_length = max_sequence_length,
-                device = device,
-                dtype = dtype
+                prompt=prompt_3, num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                device=None, # Let it run on its assigned device
+                dtype=target_dtype # Request correct dtype output if possible
             )
+            # <<< MOVE T5 OUTPUT TO TARGET DEVICE (Ensure) >>>
+            t5_prompt_embeds = t5_prompt_embeds.to(device=target_device, dtype=target_dtype, non_blocking=False) # Use blocking=False for safety
+
+
+            # === Get Llama Embeds ===
+            # Llama encoder is distributed by accelerate. Output device is complex.
             llama3_prompt_embeds = self._get_llama3_prompt_embeds(
-                prompt = prompt_4,
-                num_images_per_prompt = num_images_per_prompt,
-                max_sequence_length = max_sequence_length,
-                device = device,
-                dtype = dtype
+                prompt=prompt_4, num_images_per_prompt=num_images_per_prompt,
+                max_sequence_length=max_sequence_length,
+                device=None, # Let accelerate handle internal placement
+                dtype=target_dtype # Request correct dtype output
             )
+            # <<< MOVE FINAL LLAMA OUTPUT TO TARGET DEVICE (Ensure) >>>
+            # Move the whole stack explicitly. non_blocking=False for safety on potentially large tensor.
+            llama3_prompt_embeds = llama3_prompt_embeds.to(device=target_device, dtype=target_dtype, non_blocking=False)
+
+
+            # Combine embeds
             prompt_embeds = [t5_prompt_embeds, llama3_prompt_embeds]
+
+
+        # === Final Device/Dtype Check before returning ===
+        final_prompt_embeds = []
+        for i, embeds in enumerate(prompt_embeds):
+            print(f"[_encode_prompt] Final check prompt_embeds[{i}] device: {embeds.device}, dtype: {embeds.dtype}")
+            final_prompt_embeds.append(embeds.to(device=target_device, dtype=target_dtype)) # Ensure again
+        prompt_embeds = final_prompt_embeds
+
+        print(f"[_encode_prompt] Final check pooled_prompt_embeds device: {pooled_prompt_embeds.device}, dtype: {pooled_prompt_embeds.dtype}")
+        pooled_prompt_embeds = pooled_prompt_embeds.to(device=target_device, dtype=target_dtype) # Ensure again
+
 
         return prompt_embeds, pooled_prompt_embeds
 
